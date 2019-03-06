@@ -1,0 +1,683 @@
+from __future__ import print_function
+from __future__ import division
+
+import os
+import re
+import sys
+import time
+import datetime
+import argparse
+import scipy.io
+import os.path as osp
+import numpy as np
+
+import torch
+import torch.nn as nn
+import torch.backends.cudnn as cudnn
+from torch.utils.data import DataLoader
+from torch.optim import lr_scheduler
+import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
+from matplotlib import colors as mcolors
+
+from torchreid import data_manager
+from torchreid.dataset_loader import *
+from torchreid import transforms as T
+from torchreid import models
+from torchreid.losses import *
+from torchreid.utils.iotools import save_checkpoint, check_isfile
+from torchreid.utils.avgmeter import AverageMeter
+from torchreid.utils.logger import Logger
+from torchreid.utils.torchtools import set_bn_to_eval, count_num_param
+from torchreid.utils.reidtools import visualize_ranked_results
+from torchreid.eval_metrics import evaluate
+from torchreid.optimizers import init_optim
+
+
+parser = argparse.ArgumentParser(description='Train image model with cross entropy loss')
+# Datasets
+parser.add_argument('--root', type=str, default='data',
+                    help="root path to data directory")
+parser.add_argument('-d', '--dataset', type=str, default='market1501',
+                    choices=data_manager.get_names())
+parser.add_argument('-j', '--workers', default=4, type=int,
+                    help="number of data loading workers (default: 4)")
+parser.add_argument('--height', type=int, default=256,
+                    help="height of an image (default: 256)")
+parser.add_argument('--width', type=int, default=128,
+                    help="width of an image (default: 128)")
+parser.add_argument('--split-id', type=int, default=0,
+                    help="split index")
+# CUHK03-specific setting
+parser.add_argument('--cuhk03-labeled', action='store_true',
+                    help="whether to use labeled images, if false, detected images are used (default: False)")
+parser.add_argument('--cuhk03-classic-split', action='store_true',
+                    help="whether to use classic split by Li et al. CVPR'14 (default: False)")
+parser.add_argument('--use-metric-cuhk03', action='store_true',
+                    help="whether to use cuhk03-metric (default: False)")
+# Optimization options
+parser.add_argument('--optim', type=str, default='adam',
+                    help="optimization algorithm (see optimizers.py)")
+parser.add_argument('--max-epoch', default=60, type=int,
+                    help="maximum epochs to run")
+parser.add_argument('--start-epoch', default=0, type=int,
+                    help="manual epoch number (useful on restarts)")
+parser.add_argument('--train-batch', default=32, type=int,
+                    help="train batch size")
+parser.add_argument('--test-batch', default=100, type=int,
+                    help="test batch size")
+parser.add_argument('--lr', '--learning-rate', default=0.0003, type=float,
+                    help="initial learning rate")
+parser.add_argument('--stepsize', default=[20, 40], nargs='+', type=int,
+                    help="stepsize to decay learning rate")
+parser.add_argument('--gamma', default=0.1, type=float,
+                    help="learning rate decay")
+parser.add_argument('--weight-decay', default=5e-04, type=float,
+                    help="weight decay (default: 5e-04)")
+parser.add_argument('--fixbase-epoch', default=0, type=int,
+                    help="epochs to fix base network (only train classifier, default: 0)")
+parser.add_argument('--fixbase-lr', default=0.0003, type=float,
+                    help="learning rate (when base network is frozen)")
+parser.add_argument('--freeze-bn', action='store_true',
+                    help="freeze running statistics in BatchNorm layers during training (default: False)")
+parser.add_argument('--label-smooth', action='store_true',
+                    help="use label smoothing regularizer in cross entropy loss")
+# Architecture
+parser.add_argument('-a', '--arch', type=str, default='resnet50',
+                    choices=models.get_names())
+parser.add_argument('--loss-type', type=str, default='xent')
+# Miscs
+parser.add_argument('--print-freq', type=int, default=10,
+                    help="print frequency")
+parser.add_argument('--seed', type=int, default=1,
+                    help="manual seed")
+parser.add_argument('--resume', type=str, default='', metavar='PATH')
+parser.add_argument('--load-weights', type=str, default='',
+                    help="load pretrained weights but ignores layers that don't match in size")
+parser.add_argument('--evaluate', action='store_true',
+                    help="evaluation only")
+parser.add_argument('--eval-step', type=int, default=-1,
+                    help="run evaluation for every N epochs (set to -1 to test after training)")
+parser.add_argument('--start-eval', type=int, default=0,
+                    help="start to evaluate after specific epoch")
+parser.add_argument('--save-dir', type=str, default='log')
+parser.add_argument('--use-cpu', action='store_true',
+                    help="use cpu")
+parser.add_argument('--gpu-devices', default='0', type=str,
+                    help='gpu device ids for CUDA_VISIBLE_DEVICES')
+parser.add_argument('--vis-ranked-res', action='store_true',
+                    help="visualize ranked results, only available in evaluation mode (default: False)")
+
+args = parser.parse_args()
+# use_gpu_suo = False
+use_gpu_suo = True
+
+if use_gpu_suo:
+    args.root = '/home/weiying1/hyg/pytorch-workspace/pytorch-study/data'
+    # args.save_dir = '/home/weiying1/hyg/pytorch-workspace/pytorch-study/log-reid/hacnnv2-xent-c8m8-lr1ef2-plt-v2'
+    # args.save_dir = '/home/weiying1/hyg/pytorch-workspace/pytorch-study/log-reid/hacnn-xent-c8m8-lr1ef2-plt-sec'
+    args.save_dir = '/home/weiying1/hyg/pytorch-workspace/pytorch-study/log-reid/hacnn-xtlrnsv2-c8m8-lr1ef2-plt-sec'
+
+    # args.resume = '/home/weiying1/hyg/pytorch-workspace/pytorch-study/log-reid/vggm1024v2-pretrained_imagenet/' \
+    #               'checkpoint_pretrained_imagenet.pth.tar'
+else:
+    args.root = '/home/gysj/pytorch-workspace/pytorch-study/data'
+    args.save_dir = '/media/sda1/sleep-data/gysj/log-reid/train-cheney/hacnnv2-xent-bh5-lr1ef2'
+
+    # args.resume = '/media/sda1/sleep-data/gysj/log-reid/vggm1024v2-pretrained_imagenet/' \
+    #               'checkpoint_pretrained_imagenet.pth.tar'
+
+# args.arch = 'hacnnv2'
+args.arch = 'hacnn'
+args.dataset = 'veri776plt'
+args.gpu_devices = '0'
+args.workers = 0
+
+# args.optim = 'adam'
+args.optim = 'sgd'
+
+# args.loss_type = 'xent'
+args.loss_type = 'xent_htri'
+euclidean_distance_loss = ['angle', 'xent', 'triplet', 'xent_htri', 'tripletv2']
+
+args.lr = 1e-2
+# args.lr = 1e-3
+# args.lr = 5e-4
+# args.lr = 8e-4
+# args.lr = 5e-5
+
+# args.eval_step = 4
+args.eval_step = 1
+
+args.fixbase_lr = 5e-4
+# args.gamma = 1.0
+args.gamma = 0.1
+
+# args.weight_decay = 0
+# args.weight_decay = 5e-4
+args.weight_decay = 2e-4
+
+args.start_epoch = 0
+
+# args.max_epoch = 100
+args.max_epoch = 20
+
+args.stepsize = [10, 16]
+
+args.test_batch = 64
+
+n_classes = 8
+
+pos_samp_cnt = 10
+neg_samp_cnt = 10
+
+each_cls_max_cnt = 8
+
+args.height = 64
+args.width = 160
+# args.height = 160
+# args.width = 64
+# args.height = 20
+# args.width = 60
+
+checkpoint_suffix = ''
+# checkpoint_suffix = '_sf30lr1ef3'
+
+# args.evaluate = True
+# args.use_metric_cuhk03 = True
+# args.label_smooth = True
+
+
+class LoggerInfo():
+    def __init__(self):
+        self.checkpoint_suffix = checkpoint_suffix
+        self.start_epoch, self.train_step = self.get_start_epoch()
+
+        current_log_file = osp.join(args.save_dir,
+                                    'log_train' + self.checkpoint_suffix + '.txt')
+        previous_log_file = 'log_train'
+        if self.train_step >= 1:
+            if self.train_step == 1:
+                previous_log_file = osp.join(args.save_dir, 'log_train.txt')
+            else:
+                suffix_list = self.checkpoint_suffix.split('_')
+                for i in range(1, len(suffix_list) - 1):
+                    previous_log_file += '_'
+                    previous_log_file += suffix_list[i]
+                previous_log_file += '.txt'
+            previous_log_file = osp.join(args.save_dir, previous_log_file)
+            previous_log = self.get_previous_log(previous_log_file)
+            self.init_current_log_file(current_log_file, previous_log)
+
+        if args.evaluate:
+            self.fpath = osp.join(args.save_dir, 'log_test.txt')
+        else:
+            self.fpath = current_log_file
+
+    def get_start_epoch(self):
+        pattern_start_epoch = re.compile('(_sf(\d+))+')
+        match = pattern_start_epoch.search(self.checkpoint_suffix)
+        if match is not None:
+            match_group = match.groups()
+            return int(match_group[-1]) + 1, len(match_group)
+        return 0, 0
+
+    def get_previous_log(self, previous_log_file):
+        pattern_end_line = re.compile('Epoch:\s\[(\d+)')
+        f = open(previous_log_file)
+        lines = f.readlines()
+        f.close()
+        previous_log = []
+        for i, line in enumerate(lines):
+            match = pattern_end_line.search(line.strip())
+            if match is not None:
+                match_group = match.groups()
+                epoch = int(match_group[0])
+                if epoch == self.start_epoch:
+                    return previous_log
+            previous_log.append(line)
+        return previous_log
+
+    def init_current_log_file(self, current_log_file, previous_log):
+        f = open(current_log_file, 'w')
+        for line in previous_log:
+            f.write(line)
+        f.write('\n\n\n')
+        f.close()
+
+
+def main():
+    torch.manual_seed(args.seed)
+    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_devices
+    use_gpu = torch.cuda.is_available()
+    if args.use_cpu: use_gpu = False
+
+    logger_info = LoggerInfo()
+    sys.stdout = Logger(logger_info)
+    print("==========\nArgs:{}\n==========".format(args))
+
+    if use_gpu:
+        print("Currently using GPU {}".format(args.gpu_devices))
+        cudnn.benchmark = True
+        torch.cuda.manual_seed_all(args.seed)
+    else:
+        print("Currently using CPU (GPU is highly recommended)")
+
+    print("Initializing dataset {}".format(args.dataset))
+    dataset = data_manager.init_imgreid_dataset(
+        root=args.root, name=args.dataset, split_id=args.split_id
+    )
+
+    # transform_train = T.Compose([
+    #     T.Random2DTranslation(args.height, args.width),
+    #     T.RandomHorizontalFlip(),
+    #     T.ToTensor(),
+    #     T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    # ])
+    transform_train = T.Compose([
+        T.Random2DTranslation(args.height, args.width),
+        T.transpose_image,
+        T.ToTensor(),
+        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+    transform_test = T.Compose([
+        T.Resize((args.height, args.width)),
+        T.transpose_image,
+        T.ToTensor(),
+        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+    pin_memory = True if use_gpu else False
+
+    train_batch_sampler = ClassSampler(dataset.train, n_classes=n_classes, pos_samp_cnt=pos_samp_cnt,
+                                       neg_samp_cnt=neg_samp_cnt, each_cls_max_cnt=each_cls_max_cnt)
+    trainloader = DataLoader(
+        ImageDatasetV2(dataset.train, transform=transform_train),
+        batch_sampler=train_batch_sampler, num_workers=args.workers, pin_memory=pin_memory
+    )
+
+    # trainloader = DataLoader(
+    #     ImageDatasetV2(dataset.train, transform=transform_train),
+    #     batch_size=args.train_batch, shuffle=True, num_workers=args.workers,
+    #     pin_memory=pin_memory, drop_last=True,
+    # )
+
+    queryloader = DataLoader(
+        ImageDatasetV2(dataset.query, transform=transform_test),
+        batch_size=args.test_batch, shuffle=False, num_workers=args.workers,
+        pin_memory=pin_memory, drop_last=False,
+    )
+
+    galleryloader = DataLoader(
+        ImageDatasetV2(dataset.gallery, transform=transform_test),
+        batch_size=args.test_batch, shuffle=False, num_workers=args.workers,
+        pin_memory=pin_memory, drop_last=False,
+    )
+
+    print("Initializing model: {}".format(args.arch))
+    model = models.init_model(name=args.arch,
+                              num_classes=dataset.num_train_pids,
+                              loss_type=args.loss_type)
+    print("Model size: {:.3f} M".format(count_num_param(model)))
+
+    if args.label_smooth:
+        criterion = CrossEntropyLabelSmooth(num_classes=dataset.num_train_pids,
+                                            use_gpu=use_gpu)
+    else:
+        if args.loss_type == 'xent':
+            if args.arch in {'hacnn', 'hacnnv2'}:
+                criterion = [nn.CrossEntropyLoss(), nn.CrossEntropyLoss()]
+            else:
+                criterion = nn.CrossEntropyLoss()
+        elif args.loss_type == 'angle':
+            criterion = AngleLoss()
+        elif args.loss_type == 'triplet':
+            criterion = CoupledClustersLoss(margin=0.4, n_classes=6, n_samples=5)
+            # criterion = CoupledClustersLossV2(margin=0.4, n_classes=6, n_samples=5)
+            # criterion = OnlineTripletLoss(margin=1., triplet_selector=SemihardNegativeTripletSelector(margin=1.))
+        elif args.loss_type == 'xent_htri':
+            criterion = XentTripletLossV2(margin=1.2, triplet_selector=RandomNegativeTripletSelectorV2(margin=1.2),
+                                          each_cls_cnt=each_cls_max_cnt, n_class=n_classes)
+        else:
+            raise KeyError("Unsupported loss: {}".format(args.loss_type))
+    # model_param_list = [{'params': model.base.parameters(), 'lr': args.lr},
+    #                     {'params': model.classifier.parameters(), 'lr': args.lr * 10}]
+    # optimizer = init_optim(args.optim, model_param_list, lr=1.0, weight_decay=args.weight_decay)
+    optimizer = init_optim(args.optim, model.parameters(), args.lr,
+                           args.weight_decay)
+    scheduler = lr_scheduler.MultiStepLR(optimizer, milestones=args.stepsize,
+                                         gamma=args.gamma)
+
+    if args.fixbase_epoch > 0:
+        if hasattr(model, 'classifier') and isinstance(model.classifier,
+                                                       nn.Module):
+            optimizer_tmp = init_optim(args.optim,
+                                       model.classifier.parameters(),
+                                       args.fixbase_lr, args.weight_decay)
+        else:
+            print(
+                "Warn: model has no attribute 'classifier' and fixbase_epoch is reset to 0")
+            args.fixbase_epoch = 0
+
+    if args.load_weights:
+        # load pretrained weights but ignore layers that don't match in size
+        if check_isfile(args.load_weights):
+            checkpoint = torch.load(args.load_weights)
+            pretrain_dict = checkpoint['state_dict']
+            model_dict = model.state_dict()
+            pretrain_dict = {k: v for k, v in pretrain_dict.items() if
+                             k in model_dict and model_dict[
+                                 k].size() == v.size()}
+            model_dict.update(pretrain_dict)
+            model.load_state_dict(model_dict)
+            print(
+                "Loaded pretrained weights from '{}'".format(args.load_weights))
+
+    if args.resume:
+        # from functools import partial
+        # import pickle
+        # pickle.load = partial(pickle.load, encoding="latin1")
+        # pickle.Unpickler = partial(pickle.Unpickler, encoding="latin1")
+        if check_isfile(args.resume):
+            # checkpoint = torch.load(args.resume, map_location=lambda storage, loc: storage, pickle_module=pickle)
+            checkpoint = torch.load(args.resume)
+            model.load_state_dict(checkpoint['state_dict'])
+            pretrain_dict = checkpoint['state_dict']
+
+            model_dict = model.state_dict()
+            pretrain_dict = {k: v for k, v in pretrain_dict.items() if
+                             k in model_dict and model_dict[
+                                 k].size() == v.size()}
+            model_dict.update(pretrain_dict)
+            model.load_state_dict(model_dict)
+            args.start_epoch = checkpoint['epoch']
+            rank1 = checkpoint['rank1']
+            print("Loaded checkpoint from '{}'".format(args.resume))
+            print("- start_epoch: {}\n- rank1: {}".format(args.start_epoch,
+                                                          rank1))
+
+    if use_gpu:
+        model = nn.DataParallel(model).cuda()
+
+    if args.evaluate:
+        print("Evaluate only")
+        # rank1 = test(model, queryloader, galleryloader, train_query_loader, train_gallery_loader, use_gpu)
+        # state_dict = model.module.state_dict()
+        # save_checkpoint({
+        #     'state_dict': state_dict,
+        #     'rank1': rank1,
+        #     'epoch': 0
+        # }, is_best=False, use_gpu_suo=False, fpath=osp.join(args.save_dir, 'checkpoint_pretrained_imagenet.pth.tar'))
+        # distmat = test(model, queryloader, galleryloader, train_query_loader, train_gallery_loader,
+        #                use_gpu, return_distmat=True)
+        distmat = test(model, queryloader, galleryloader, use_gpu)
+        if args.vis_ranked_res:
+            visualize_ranked_results(
+                distmat, dataset,
+                save_dir=osp.join(args.save_dir, 'ranked_results'),
+                topk=20)
+        return
+
+    start_time = time.time()
+    train_time = 0
+    best_rank1 = -np.inf
+    best_epoch = 0
+    print("==> Start training")
+
+    if args.fixbase_epoch > 0:
+        print(
+            "Train classifier for {} epochs while keeping base network frozen".format(
+                args.fixbase_epoch))
+
+        for epoch in range(args.fixbase_epoch):
+            start_train_time = time.time()
+            train(epoch, model, criterion, optimizer_tmp, trainloader, use_gpu,
+                  freeze_bn=True)
+            train_time += round(time.time() - start_train_time)
+
+        del optimizer_tmp
+        print("Now open all layers for training")
+
+    for epoch in range(args.start_epoch, args.max_epoch):
+        start_train_time = time.time()
+        train(epoch, model, criterion, optimizer, trainloader, use_gpu)
+        train_time += round(time.time() - start_train_time)
+        scheduler.step()
+
+        if (epoch + 1) > args.start_eval \
+                and args.eval_step > 0 \
+                and (epoch + 1) % args.eval_step == 0 \
+                or (epoch + 1) == args.max_epoch:
+            print("==> Test")
+            # rank1 = test(model, queryloader, galleryloader, train_query_loader, train_gallery_loader, use_gpu)
+            rank1 = test(model, queryloader, galleryloader, use_gpu)
+            is_best = rank1 > best_rank1
+
+            if is_best:
+                best_rank1 = rank1
+                best_epoch = epoch + 1
+
+            if use_gpu:
+                state_dict = model.module.state_dict()
+            else:
+                state_dict = model.state_dict()
+
+            save_checkpoint({
+                'state_dict': state_dict,
+                'rank1': rank1,
+                'epoch': epoch + 1,
+            }, is_best, use_gpu_suo=use_gpu_suo,
+                fpath=osp.join(args.save_dir, 'checkpoint_ep' + str(
+                    epoch + 1) + checkpoint_suffix + '.pth.tar'))
+
+    print("==> Best Rank-1 {:.2%}, achieved at epoch {}".format(best_rank1,
+                                                                best_epoch))
+    elapsed = round(time.time() - start_time)
+    elapsed = str(datetime.timedelta(seconds=elapsed))
+    train_time = str(datetime.timedelta(seconds=train_time))
+    print(
+        "Finished. Total elapsed time (h:m:s): {}. Training time (h:m:s): {}.".format(
+            elapsed, train_time))
+
+
+def train(epoch, model, criterion, optimizer, trainloader, use_gpu,
+          freeze_bn=False):
+    losses = AverageMeter()
+    batch_time = AverageMeter()
+    data_time = AverageMeter()
+    all_acc = AverageMeter()
+
+    model.train()
+
+    if freeze_bn or args.freeze_bn:
+        model.apply(set_bn_to_eval)
+
+    end = time.time()
+    for batch_idx, (imgs, pids, _, _) in enumerate(trainloader):
+        data_time.update(time.time() - end)
+
+        if use_gpu:
+            imgs, pids = imgs.cuda(), pids.cuda()
+
+        outputs = model(imgs)
+        if args.loss_type == 'xent':
+            if args.arch in {'hacnn', 'hacnnv2'}:
+                loss_xent_p1 = criterion[0](outputs[0], pids)
+                loss_xent_p2 = criterion[1](outputs[1], pids)
+                loss = 0.5 * (loss_xent_p1 + loss_xent_p2)
+        elif args.loss_type == 'xent_htri':
+            loss = criterion(outputs[0], outputs[1], pids, 0)
+        else:
+            raise KeyError("Unsupported loss: {}".format(args.loss_type))
+        loss = loss[0] if type(loss) in (tuple, list) else loss
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        batch_time.update(time.time() - end)
+
+        losses.update(loss.item(), pids.size(0))
+        # all_acc.update(acc, pids.size(0))
+
+        # if (batch_idx + 1) % args.print_freq == 0:
+        #     print('Epoch: [{0}][{1}/{2}]\t'
+        #           'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+        #           'ACC {acc.val:.4f} ({acc.avg:.4f})\t'
+        #           'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+        #           'Data {data_time.val:.4f} ({data_time.avg:.4f})\t'.format(
+        #         epoch + 1, batch_idx + 1, len(trainloader),
+        #         loss=loss, acc=all_acc,
+        #         batch_time=batch_time, data_time=data_time))
+
+        if (batch_idx + 1) % args.print_freq == 0:
+            print('Epoch: [{0}][{1}/{2}]\t'
+                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                  'Data {data_time.val:.4f} ({data_time.avg:.4f})\t'.format(
+                epoch + 1, batch_idx + 1, len(trainloader),
+                loss=losses, batch_time=batch_time, data_time=data_time))
+
+        end = time.time()
+
+
+def test(model, queryloader, galleryloader, use_gpu, ranks=[1, 5, 10, 20],
+         return_distmat=False):
+    batch_time = AverageMeter()
+    model.eval()
+
+    with torch.no_grad():
+        qf, q_pids, q_camids, q_paths = [], [], [], []
+        for batch_idx, (imgs, pids, camids, paths) in enumerate(queryloader):
+            if use_gpu: imgs = imgs.cuda()
+
+            end = time.time()
+            features = model(imgs)
+            batch_time.update(time.time() - end)
+
+            features = features.data.cpu()
+            qf.append(features)
+            q_pids.extend(pids)
+            q_camids.extend(camids)
+            q_paths.extend(paths)
+        qf = torch.cat(qf, 0)
+        q_pids = np.asarray(q_pids)
+        q_camids = np.asarray(q_camids)
+        q_paths = np.asarray(q_paths)
+        print("Extracted features for query set, obtained {}-by-{} matrix".format(qf.size(0), qf.size(1)))
+        print("==> BatchTime(s)/BatchSize(img): {:.3f}/{}".format(batch_time.avg, args.test_batch))
+
+        gf, g_pids, g_camids, g_paths = [], [], [], []
+        for batch_idx, (imgs, pids, camids, paths) in enumerate(galleryloader):
+            if use_gpu: imgs = imgs.cuda()
+
+            end = time.time()
+            features = model(imgs)
+            batch_time.update(time.time() - end)
+
+            features = features.data.cpu()
+            gf.append(features)
+            g_pids.extend(pids)
+            g_camids.extend(camids)
+            g_paths.extend(paths)
+        gf = torch.cat(gf, 0)
+        g_pids = np.asarray(g_pids)
+        g_camids = np.asarray(g_camids)
+        g_paths = np.asarray(g_paths)
+
+        # TSNE analysis
+        # tsne_show(data=np.array(gf), labels=g_pids)
+
+        print("Extracted features for gallery set, obtained {}-by-{} matrix".format(gf.size(0), gf.size(1)))
+        print("==> BatchTime(s)/BatchSize(img): {:.3f}/{}".format(batch_time.avg, args.test_batch))
+
+    print("Start compute euclidean distmat.")
+    if args.loss_type in euclidean_distance_loss:
+        m, n = qf.size(0), gf.size(0)
+        distmat = torch.pow(qf, 2).sum(dim=1, keepdim=True).expand(m, n) + \
+                  torch.pow(gf, 2).sum(dim=1, keepdim=True).expand(n, m).t()
+        distmat.addmm_(1, -2, qf, gf.t())
+        distmat = distmat.numpy()
+    print("Compute euclidean distmat done.")
+    print("distmat shape:", distmat.shape)
+    # result = {'query_f': qf.numpy(),
+    #           'query_cam': q_camids, 'query_label': q_pids, 'quim_path': q_paths,
+    #           'gallery_f': gf.numpy(),
+    #           'gallery_cam': g_camids, 'gallery_label': g_pids, 'gaim_path': g_paths}
+    # scipy.io.savemat(os.path.join(args.save_dir, 'features_' + str(60) + '.mat'), result)
+    # dist_mat_dict = {'dist_mat': distmat}
+    # scipy.io.savemat(os.path.join(args.save_dir, 'features_' + str(60) + '_dist.mat'), dist_mat_dict)
+    print("Start computing CMC and mAP")
+    start_time = time.time()
+    cmc, mAP = evaluate(distmat, q_pids, g_pids, q_camids, g_camids,
+                        use_metric_cuhk03=args.use_metric_cuhk03,
+                        use_cython=False)
+
+    elapsed = round(time.time() - start_time)
+    elapsed = str(datetime.timedelta(seconds=elapsed))
+    print("Evaluate test data time (h:m:s): {}.".format(elapsed))
+    print("Test data results ----------")
+    print("temAP: {:.2%}".format(mAP))
+    print("CMC curve")
+    for r in ranks:
+        print("teRank-{:<3}: {:.2%}".format(r, cmc[r - 1]))
+    print("------------------")
+
+    if return_distmat:
+        return distmat
+    return cmc[0]
+
+
+def tsne_show(data, labels, title=''):
+    print("start tsne analysis...")
+    sorted_ftrs = []
+    uniq_labels = np.array(sorted(list(set(labels))))
+    all_cls_ft_num = np.zeros(len(uniq_labels))
+    # color_list = list(colors._colors_full_map.values())
+    colors = dict(mcolors.BASE_COLORS, **mcolors.CSS4_COLORS)
+    by_hsv = sorted(
+        (tuple(mcolors.rgb_to_hsv(mcolors.to_rgba(color)[:3])), name)
+        for name, color in colors.items())
+    color_list = [name for hsv, name in by_hsv]
+
+    for i, lb in enumerate(uniq_labels):
+        corr_ftrs = data[labels == lb]
+        all_cls_ft_num[i] = len(corr_ftrs)
+        sorted_ftrs.extend(corr_ftrs)
+    sorted_ftrs = np.array(sorted_ftrs)
+
+    ft_tsne = TSNE(init='pca').fit_transform(sorted_ftrs[:3000])
+    ft_min, ft_max = ft_tsne.min(0), ft_tsne.max(0)
+    ft_norm = (ft_tsne - ft_min) / (ft_max - ft_min)
+    j = 0
+    gd_cls = 0
+    lst_gd_cls = 0
+    cls_ft_num = all_cls_ft_num[j]
+    plt.figure(figsize=(10, 10))
+
+    for i in range(ft_norm.shape[0]):
+        if i >= cls_ft_num:
+            j += 1
+            cls_ft_num += all_cls_ft_num[j]
+        if all_cls_ft_num[j] >= 20:
+            if j > lst_gd_cls:
+                gd_cls += 1
+            plt.scatter(ft_norm[i, 0], ft_norm[i, 1],
+                        color=color_list[3 * gd_cls])
+            lst_gd_cls = gd_cls
+        if gd_cls >= 50:
+            break
+        # plt.scatter(ft_norm[i, 0], ft_norm[i, 1], color=color_list[j])
+        # if j >= 20:
+        #     break
+    print(j)
+    plt.title(title + 'resnet >=20 * 50')
+    plt.show()
+
+
+if __name__ == '__main__':
+    main()
+
+
+
